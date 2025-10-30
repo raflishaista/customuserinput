@@ -437,3 +437,77 @@ def custom_talent_search(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             json.dumps({"error": str(e)}), status_code=500
         )
+
+@app.route(route="blob_custom_talent_search", methods=["POST"])
+def blob_custom_talent_search(req: func.HttpRequest) -> func.HttpResponse:
+    import requests
+    logging.info("Custom Talent Search - Using precomputed df_final from Azure Blob.")
+
+    try:
+        # Parse request body
+        body = req.get_json()
+        user_input = body.get("user_input", {})
+        top_n = int(body.get("top_n", 10))
+
+        # === 1️⃣ Load precomputed df_final from Blob ===
+        url = "https://azurecleanstorage.blob.core.windows.net/blobcleancontainer/latest.json"
+        response = requests.get(url)
+        if response.status_code != 200:
+            return func.HttpResponse(
+                json.dumps({"error": "Failed to fetch df_final from Azure Blob"}),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        df_final = pd.DataFrame(response.json())
+
+        # === 2️⃣ Prepare query ===
+        responsibility = user_input.get("responsibility", "")
+        skill1 = user_input.get("skill1", "")
+        skill2 = user_input.get("skill2", "")
+        role = user_input.get("role", "")
+        job_level = user_input.get("job_level", 0)
+        query_sentence = f"{responsibility} {skill1} {skill2} {role}"
+
+        # === 3️⃣ Compute similarity ===
+        model = get_model()
+        corpus = df_final["Responsibilities"].fillna("").tolist()
+        embeddings = model.encode([query_sentence] + corpus)
+        sims = cosine_similarity([embeddings[0]], embeddings[1:])[0]
+        df_final["similarity_to_query"] = sims
+
+        # === 4️⃣ Compute combined ranking score ===
+        if "finalscore_scaled" not in df_final.columns:
+            df_final["finalscore_scaled"] = 0.5  # fallback
+        df_final["combined_score"] = (
+            0.5 * df_final["similarity_to_query"] +
+            0.5 * df_final["finalscore_scaled"]
+        )
+
+        # === 5️⃣ Sort and get top results ===
+        df_ranked = df_final.sort_values("combined_score", ascending=False)
+        top_results = df_ranked.head(top_n)
+
+        # === 6️⃣ Prepare response ===
+        metadata = {
+            "query": user_input,
+            "source": url,
+            "total_candidates": len(df_final),
+            "returned_candidates": len(top_results)
+        }
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "metadata": metadata,
+                "results": json.loads(top_results.to_json(orient="records"))
+            }, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.error(f"Error in custom_talent_search: {e}", exc_info=True)
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}), status_code=500
+        )
