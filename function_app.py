@@ -194,123 +194,74 @@ def blob_custom_talent_search(req: func.HttpRequest) -> func.HttpResponse:
                 return np.nan
 
         merged["Skill Score"] = merged.apply(get_skill_score, axis=1)
+        # ✅ Normalize roles to ensure match with query
+        role_normalization = {
+            "Artificial Intelligence Engineer": "AI Engineer",
+            "Artificial Intelligence Specialist": "AI Engineer",
+            "Data Analyst": "Data Analyst",  # example, add if more exist
+        }
+        df_skillinv["Role"] = df_skillinv["Role"].replace(role_normalization)
+        df_final["Role Person"] = df_final["Role Person"].replace(role_normalization)
+
+        # ✅ Aggregate skill similarity per candidate BEFORE merge (original logic)
         df_search = merged.groupby(
-            ["Skillset", "UNIQUE ID", "Role Person"], as_index=False
-        ).agg(Avg_SkillScore=("Skill Score", "mean"))
-
-        # 6️⃣ Merge with talent + eval + df_final
-        if "LAMA KERJA BERJALAN" in df_talent.columns:
-            df_talent["Durasi Bulan"] = df_talent["LAMA KERJA BERJALAN"].apply(convert_to_months)
-        else:
-            df_talent["Durasi Bulan"] = 0
-
-        df_eval["scoring_eval"] = (
-            df_talent["Durasi Bulan"] * bobot_durasi +
-            df_eval["Capability Score"] * bobot_cap_score
+            ["UNIQUE ID", "Role Person"], as_index=False
+        ).agg(
+            Avg_SkillScore=("Skill Score", "mean")
         )
 
+        # ✅ Merge with talent, eval, df_final
         df_merged = (
             df_search
             .merge(df_talent, on="UNIQUE ID", how="left")
             .merge(df_eval, on="UNIQUE ID", how="left")
-            .merge(df_final, on="UNIQUE ID", how="left")
+            .merge(df_final, on="UNIQUE ID", how="left", suffixes=("", "_final"))
         )
 
-        # Clean duplicate role/name columns created by merge
+        # ✅ Drop duplicate role columns from merge
         for col in ["Role Person", "Role", "Responsibilities"]:
-            if f"{col}_x" in df_merged.columns:
-                df_merged[col] = df_merged[f"{col}_x"]
-            elif f"{col}_y" in df_merged.columns:
-                df_merged[col] = df_merged[f"{col}_y"]
+            if f"{col}_final" in df_merged.columns:
+                df_merged[col] = df_merged[f"{col}_final"]
 
-        # Drop all *_x *_y leftovers
-        df_merged = df_merged.loc[:, ~df_merged.columns.str.endswith(("_x", "_y"))]
+        df_merged = df_merged.loc[:, ~df_merged.columns.str.endswith("_final")]
 
-        # 7️⃣ Compute final scores (robust version)
-        # Ensure job_count exists, even if df_hist is missing
-        if df_hist is not None and "UNIQUE ID" in df_hist.columns and "PRODUCT / USECASE" in df_hist.columns:
-            job_counts = df_hist.groupby("UNIQUE ID")["PRODUCT / USECASE"].nunique().reset_index()
-            df_merged = df_merged.merge(job_counts, on="UNIQUE ID", how="left")
-            df_merged.rename(columns={"PRODUCT / USECASE": "job_count"}, inplace=True)
+        # ✅ Job Count (if history exists)
+        if df_hist is not None and "UNIQUE ID" in df_hist.columns:
+            job_counts = df_hist.groupby("UNIQUE ID")["PRODUCT / USECASE"].nunique()
+            df_merged["job_count"] = df_merged["UNIQUE ID"].map(job_counts).fillna(0)
         else:
-            df_merged["job_count"] = 0  # default if history data missing
+            df_merged["job_count"] = 0
 
-        # Ensure Avg_SkillScore exists (can fallback from df_final or 0)
-        try:
-            if "Avg_SkillScore" in df_merged.columns:
-                # already present from earlier pipeline — keep it
-                pass
-            else:
-                # ensure UNIQUE ID types align (strings)
-                df_merged["UNIQUE ID"] = df_merged["UNIQUE ID"].astype(str)
-                df_final["UNIQUE ID"] = df_final["UNIQUE ID"].astype(str)
+        # ✅ Ensure key fields exist
+        df_merged["Avg_SkillScore"] = df_merged["Avg_SkillScore"].fillna(0)
+        df_merged["scoring_eval"] = df_merged["scoring_eval"].fillna(0)
 
-                if "Avg_SkillScore" in df_final.columns:
-                    # create a unique series by aggregating duplicates (mean)
-                    avg_skill_by_uid = df_final.groupby("UNIQUE ID")["Avg_SkillScore"].mean()
-                    df_merged["Avg_SkillScore"] = df_merged["UNIQUE ID"].map(avg_skill_by_uid)
-
-                    # If some UIDs are still NaN (not found), fill with 0
-                    df_merged["Avg_SkillScore"] = df_merged["Avg_SkillScore"].fillna(0)
-
-                    # Optional: log how many mapped vs missing
-                    mapped = df_merged["Avg_SkillScore"].astype(bool).sum()
-                    logging.info(f"Mapped Avg_SkillScore for {mapped}/{len(df_merged)} candidates from df_final")
-                else:
-                    # df_final doesn't contain Avg_SkillScore; fallback to zero
-                    df_merged["Avg_SkillScore"] = 0
-                    logging.warning("df_final does not contain Avg_SkillScore; defaulting Avg_SkillScore to 0")
-        except Exception as ex:
-            logging.error(f"Error while mapping Avg_SkillScore: {ex}", exc_info=True)
-            df_merged["Avg_SkillScore"] = 0
-
-        try:
-            # ensure consistent types
-            df_merged["UNIQUE ID"] = df_merged["UNIQUE ID"].astype(str)
-            df_final["UNIQUE ID"] = df_final["UNIQUE ID"].astype(str)
-
-            if "scoring_eval" in df_merged.columns:
-                # already exists, nothing to do
-                logging.info("scoring_eval already in df_merged")
-            elif "scoring_eval" in df_final.columns:
-                # aggregate duplicates (mean per UNIQUE ID)
-                scoring_eval_by_uid = df_final.groupby("UNIQUE ID")["scoring_eval"].mean()
-                df_merged["scoring_eval"] = df_merged["UNIQUE ID"].map(scoring_eval_by_uid)
-                df_merged["scoring_eval"] = df_merged["scoring_eval"].fillna(0)
-                logging.info(f"Mapped scoring_eval for {df_merged['scoring_eval'].astype(bool).sum()} records")
-            else:
-                # fallback default
-                df_merged["scoring_eval"] = 0
-                logging.warning("scoring_eval not found in df_final; defaulting to 0")
-        except Exception as ex:
-            logging.error(f"Error while mapping scoring_eval: {ex}", exc_info=True)
-            df_merged["scoring_eval"] = 0
-        # Calculate d safely
-        
-        df_merged = df_merged.loc[:, ~df_merged.columns.duplicated()].copy()
-        df_merged.columns = df_merged.columns.str.replace(r"\.\d+$", "", regex=True)
-
+        # ✅ Weighted score (d)
         df_merged["d"] = (
-            df_merged["Avg_SkillScore"].fillna(0) * a +
-            df_merged["scoring_eval"].fillna(0) * b +
-            df_merged["job_count"].fillna(0) * c
+            df_merged["Avg_SkillScore"] * a +
+            df_merged["scoring_eval"] * b +
+            df_merged["job_count"] * c
         )
-        if "Role Person" not in df_merged.columns:
-            if "Role" in df_merged.columns:
-                df_merged["Role Person"] = df_merged["Role"]
-            else:
-                df_merged["Role Person"] = "Unknown"
-                logging.warning("Missing 'Role Person' column; defaulted to 'Unknown'.")
-        df_merged["finalscore"] = df_merged.apply(
-            lambda row: row["d"] * r if row["Role Person"] == role else row["d"], axis=1
-        )
-        df_merged["finalscore_scaled"] = minmax_scaling(df_merged["finalscore"])
-        
-        df_merged = df_merged.sort_values("finalscore_scaled", ascending=False)
-        df_merged = df_merged.drop_duplicates(subset=["UNIQUE ID"], keep="first")
 
-        # 8️⃣ Rank results
-        df_ranked = df_merged.sort_values("finalscore_scaled", ascending=False).head(top_n)
+        # ✅ Apply bonus multiplier for correct role match
+        df_merged["finalscore"] = df_merged.apply(
+            lambda row: row["d"] * r if str(row["Role Person"]).strip().lower() == str(role).strip().lower() else row["d"],
+            axis=1
+        )
+
+        # ✅ Scale
+        df_merged["finalscore_scaled"] = minmax_scaling(df_merged["finalscore"])
+
+        # ✅ Final unique ranking — just like merged_results
+        df_ranked_full = (
+            df_merged
+            .sort_values("finalscore_scaled", ascending=False)
+            .drop_duplicates(subset=["UNIQUE ID"], keep="first")
+        )
+
+        # This is your full ranked list
+        results = json.loads(df_ranked_full.to_json(orient="records"))
+
         
         # --- CLEAN COLUMN NAME COLLISIONS ---
         for col in ["Role Person", "Role", "Responsibilities"]:
@@ -325,24 +276,21 @@ def blob_custom_talent_search(req: func.HttpRequest) -> func.HttpResponse:
         df_merged = df_merged.sort_values("finalscore_scaled", ascending=False)
         df_merged = df_merged.drop_duplicates(subset=["UNIQUE ID"], keep="first")
 
-        metadata = {
-            "query": user_input,
-            "source_blob": blob_url,
-            "total_candidates": len(df_merged),
-            "returned_candidates": len(df_ranked)
-        }
-
         # ✅ Final response
         return func.HttpResponse(
             json.dumps({
                 "status": "success",
-                "metadata": metadata,
-                "results": json.loads(df_ranked.to_json(orient="records"))
+                "metadata": {
+                    "query": user_input,
+                    "source_blob": blob_url,
+                    "total_candidates": len(df_ranked_full),
+                    "returned_candidates": len(df_ranked_full),
+                },
+                "results": results  # FULL ranked list
             }, indent=2),
             mimetype="application/json",
             status_code=200
         )
-
     except Exception as e:
         logging.error(f"Error in hybrid_custom_talent_search: {e}", exc_info=True)
         return func.HttpResponse(
