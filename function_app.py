@@ -8,6 +8,9 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from io import BytesIO
 import base64
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -103,6 +106,25 @@ def load_datasets_from_json(json_data):
             loaded[key] = pd.DataFrame(data)
     return loaded
 
+
+def load_datasets_from_json_newfile(json_data):
+    """Convert uploaded datasets JSON → dictionary of pandas DataFrames."""
+    loaded = {}
+    filename_mapping = {
+        "Usecase Requirement.xlsx": "df_ureq",
+        "(Pseudonym) Talent Data.xlsx": "df_talent",
+        "(Pseudonym) Self-Assessment Score.xlsx": "df_selfassessment",
+        "(Pseudonym) History Usecase.xlsx": "df_hist",
+        "(Pseudonym) Capability Scores.xlsx": "df_eval",
+        "(Pseudonym) Assignment Data.xlsx": "df_assign"
+    }
+    for f in json_data:
+        name, data = f.get("FileName"), f.get("Data")
+        key = filename_mapping.get(name)
+        if key and data:
+            loaded[key] = pd.DataFrame(data)
+    return loaded
+
 def load_final_df_from_blob(url):
     """Fetch df_final (preprocessed) JSON from Azure Blob Storage."""
     response = requests.get(url)
@@ -113,24 +135,32 @@ def load_final_df_from_blob(url):
 # MAIN ENDPOINT
 # ============================================================
 
-@app.route(route="blob_custom_talent_search", methods=["POST"])
-def blob_custom_talent_search(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="blob_custom_talent_search_unified", methods=["POST"])
+def blob_custom_talent_search_unified(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Hybrid Custom Talent Search:
-    - Loads df_final from Azure Blob
-    - Loads other datasets (skillinv, eval, etc.) from JSON input
-    - Computes similarity and scores dynamically
+    Unified Talent Search:
+    - Supports BOTH single and multiple user_input formats.
+      user_input = { ... }     → single mode
+      user_input = [ {...} ]   → multi mode
+    - Runs the same logic for each.
     """
 
     try:
-        logging.info("Starting hybrid_custom_talent_search...")
+        logging.info("Starting unified custom talent search...")
 
-        # 1️⃣ Parse request
+        # -------------------------------------------------------
+        # 1️⃣ Parse Request
+        # -------------------------------------------------------
         body = req.get_json()
-        user_input = body.get("user_input", {})
-        datasets_json = body.get("datasets", [])
-        blob_url = body.get("blob_url", "https://azurecleanstorage.blob.core.windows.net/blobcleancontainer/latest.json")
 
+        raw_user_input = body.get("user_input")
+        datasets_json = body.get("datasets", [])
+        blob_url = body.get("blob_url")
+
+        if not blob_url:
+            blob_url = "https://azurecleanstorage.blob.core.windows.net/blobcleancontainer/latest.json"
+
+        # Parameters
         threshold = float(body.get("threshold", 0.3))
         top_n = int(body.get("top_n", 10))
         coefficients = body.get("coefficients", {})
@@ -141,158 +171,177 @@ def blob_custom_talent_search(req: func.HttpRequest) -> func.HttpResponse:
         bobot_cap_score = float(coefficients.get("bobot_cap_score", 0.8))
         bobot_durasi = float(coefficients.get("bobot_durasi", 0.2))
 
-        # 2️⃣ Load datasets
-        datasets = load_datasets_from_json(datasets_json)
-        df_skillinv = datasets.get("df_skillinv")
+        # -------------------------------------------------------
+        # 2️⃣ Normalize user_input → always becomes a list
+        # -------------------------------------------------------
+        if raw_user_input is None:
+            return func.HttpResponse(
+                json.dumps({"error": "'user_input' field is missing"}),
+                status_code=400
+            )
+
+        if isinstance(raw_user_input, dict):
+            user_inputs = [raw_user_input]
+            single_mode = True
+        elif isinstance(raw_user_input, list):
+            if not all(isinstance(x, dict) for x in raw_user_input):
+                return func.HttpResponse(
+                    json.dumps({"error": "Every element inside user_input must be an object/dict"}),
+                    status_code=400
+                )
+            user_inputs = raw_user_input
+            single_mode = False
+        else:
+            return func.HttpResponse(
+                json.dumps({"error": "user_input must be an object or a list of objects"}),
+                status_code=400
+            )
+
+        # -------------------------------------------------------
+        # 3️⃣ Load all datasets
+        # -------------------------------------------------------
+        datasets = load_datasets_from_json_newfile(datasets_json)
+
+        df_selfassessment = datasets.get("df_selfassessment")
         df_talent = datasets.get("df_talent")
         df_eval = datasets.get("df_eval")
         df_hist = datasets.get("df_hist")
         df_final = load_final_df_from_blob(blob_url)
 
-        if df_skillinv is None or df_talent is None or df_eval is None:
+        if df_selfassessment is None or df_talent is None or df_eval is None:
             return func.HttpResponse(
-                json.dumps({"error": "Missing required datasets (skillinv, talent, eval)."}), status_code=400
+                json.dumps({"error": "Missing required datasets (selfassessment, talent, eval)."}),
+                status_code=400
             )
-
-        # 3️⃣ Build query sentence
-        responsibility = user_input.get("responsibility", "")
-        skill1 = user_input.get("skill1", "")
-        skill2 = user_input.get("skill2", "")
-        role = user_input.get("role", "")
-        job_level = user_input.get("job_level", 0)
-        query_text = f"{responsibility} {skill1} {skill2} {role}"
 
         model = get_model()
 
-        # 4️⃣ Compute similarity with skill inventory
-        skillsets = df_skillinv.columns[2:-1].tolist()
-        corpus = [query_text] + skillsets
-        embeddings = model.encode(corpus)
-        cosine_sim = cosine_similarity([embeddings[0]], embeddings[1:])[0]
+        # -------------------------------------------------------
+        # 4️⃣ Define reusable processing function for 1 input
+        # -------------------------------------------------------
 
-        df_similarity = pd.DataFrame({
-            "Skillset": skillsets,
-            "Similarity": cosine_sim
-        })
-        df_similarity = df_similarity[df_similarity["Similarity"] >= threshold]
+        def process_one_input(user_input):
+            # Extract fields
+            responsibility = user_input.get("responsibility", "")
+            skill1 = user_input.get("skill1", "")
+            skill2 = user_input.get("skill2", "")
+            role = user_input.get("role", "")
+            job_level = user_input.get("job_level", 0)
 
-        if df_similarity.empty:
-            return func.HttpResponse(
-                json.dumps({"message": "No matching skills found above threshold."}),
-                status_code=200
+            query_text = f"{responsibility} {skill1} {skill2} {role}"
+
+            # --- Compute similarity
+            skillsets = [c for c in df_selfassessment.columns if c not in ["UNIQUE ID"]]
+            corpus = [query_text] + skillsets
+            embeddings = model.encode(corpus)
+            cosine_sim = cosine_similarity([embeddings[0]], embeddings[1:])[0]
+
+            df_similarity = pd.DataFrame({
+                "Skillset": skillsets,
+                "Similarity": cosine_sim
+            })
+            df_similarity = df_similarity[df_similarity["Similarity"] >= threshold]
+
+            if df_similarity.empty:
+                return {
+                    "metadata": {
+                        "query": user_input,
+                        "message": "No matching skills found above threshold."
+                    },
+                    "results": []
+                }
+
+            # Cross join IDs
+            unique_ids = df_selfassessment[["UNIQUE ID"]].drop_duplicates()
+            merged = df_similarity.merge(unique_ids, how="cross")
+
+            def get_skill_score(row):
+                try:
+                    val = df_selfassessment.loc[
+                        df_selfassessment["UNIQUE ID"] == row["UNIQUE ID"], row["Skillset"]
+                    ]
+                    return float(val.values[0]) if not val.empty else np.nan
+                except:
+                    return np.nan
+
+            merged["Skill Score"] = merged.apply(get_skill_score, axis=1)
+
+            # Aggregate
+            df_search = merged.groupby("UNIQUE ID", as_index=False).agg(
+                Avg_SkillScore=("Skill Score", "mean")
             )
 
-        # 5️⃣ Cross join with UNIQUE IDs and calculate skill scores
-        unique_roles = df_skillinv[["UNIQUE ID", "Role"]].rename(columns={"Role": "Role Person"}).drop_duplicates()
-        merged = df_similarity.merge(unique_roles, how="cross")
+            # Merge additional datasets
+            df_merged = (
+                df_search
+                .merge(df_talent, on="UNIQUE ID", how="left")
+                .merge(df_eval, on="UNIQUE ID", how="left")
+                .merge(df_final, on="UNIQUE ID", how="left", suffixes=("", "_final"))
+            )
 
-        def get_skill_score(row):
-            try:
-                val = df_skillinv.loc[df_skillinv["UNIQUE ID"] == row["UNIQUE ID"], row["Skillset"]]
-                return float(val.values[0]) if not val.empty else np.nan
-            except Exception:
-                return np.nan
+            for col in ["Role", "Responsibilities"]:
+                if f"{col}_final" in df_merged.columns:
+                    df_merged[col] = df_merged[f"{col}_final"]
 
-        merged["Skill Score"] = merged.apply(get_skill_score, axis=1)
-        # ✅ Normalize roles to ensure match with query
-        role_normalization = {
-            "Artificial Intelligence Engineer": "AI Engineer",
-            "Artificial Intelligence Specialist": "AI Engineer",
-            "Data Analyst": "Data Analyst",  # example, add if more exist
-        }
-        df_skillinv["Role"] = df_skillinv["Role"].replace(role_normalization)
-        df_final["Role Person"] = df_final["Role Person"].replace(role_normalization)
+            df_merged = df_merged.loc[:, ~df_merged.columns.str.endswith("_final")]
 
-        # ✅ Aggregate skill similarity per candidate BEFORE merge (original logic)
-        df_search = merged.groupby(
-            ["UNIQUE ID", "Role Person"], as_index=False
-        ).agg(
-            Avg_SkillScore=("Skill Score", "mean")
-        )
+            # job_count from history
+            if df_hist is not None and "UNIQUE ID" in df_hist.columns:
+                job_counts = df_hist.groupby("UNIQUE ID")["PRODUCT / USECASE"].nunique()
+                df_merged["job_count"] = df_merged["UNIQUE ID"].map(job_counts).fillna(0)
+            else:
+                df_merged["job_count"] = 0
 
-        # ✅ Merge with talent, eval, df_final
-        df_merged = (
-            df_search
-            .merge(df_talent, on="UNIQUE ID", how="left")
-            .merge(df_eval, on="UNIQUE ID", how="left")
-            .merge(df_final, on="UNIQUE ID", how="left", suffixes=("", "_final"))
-        )
+            # Weighted scoring
+            df_merged["Avg_SkillScore"] = df_merged["Avg_SkillScore"].fillna(0)
+            df_merged["Capability Score"] = df_merged["Capability Score"].fillna(0)
 
-        # ✅ Drop duplicate role columns from merge
-        for col in ["Role Person", "Role", "Responsibilities"]:
-            if f"{col}_final" in df_merged.columns:
-                df_merged[col] = df_merged[f"{col}_final"]
+            df_merged["d"] = (
+                df_merged["Avg_SkillScore"] * a +
+                df_merged["Capability Score"] * b +
+                df_merged["job_count"] * c
+            )
 
-        df_merged = df_merged.loc[:, ~df_merged.columns.str.endswith("_final")]
+            def apply_role_bonus(row):
+                role_final = str(row.get("Role", "")).strip().lower()
+                return row["d"] * r if role_final == role.lower().strip() else row["d"]
 
-        # ✅ Job Count (if history exists)
-        if df_hist is not None and "UNIQUE ID" in df_hist.columns:
-            job_counts = df_hist.groupby("UNIQUE ID")["PRODUCT / USECASE"].nunique()
-            df_merged["job_count"] = df_merged["UNIQUE ID"].map(job_counts).fillna(0)
-        else:
-            df_merged["job_count"] = 0
+            df_merged["finalscore"] = df_merged.apply(apply_role_bonus, axis=1)
+            df_merged["finalscore_scaled"] = minmax_scaling(df_merged["finalscore"])
 
-        # ✅ Ensure key fields exist
-        df_merged["Avg_SkillScore"] = df_merged["Avg_SkillScore"].fillna(0)
-        df_merged["scoring_eval"] = df_merged["scoring_eval"].fillna(0)
+            df_ranked = (
+                df_merged.sort_values("finalscore_scaled", ascending=False)
+                .drop_duplicates(subset=["UNIQUE ID"], keep="first")
+            )
 
-        # ✅ Weighted score (d)
-        df_merged["d"] = (
-            df_merged["Avg_SkillScore"] * a +
-            df_merged["scoring_eval"] * b +
-            df_merged["job_count"] * c
-        )
+            results = json.loads(df_ranked.to_json(orient="records"))
+            results = results[:top_n]
 
-        # ✅ Apply bonus multiplier for correct role match
-        df_merged["finalscore"] = df_merged.apply(
-            lambda row: row["d"] * r if str(row["Role Person"]).strip().lower() == str(role).strip().lower() else row["d"],
-            axis=1
-        )
-
-        # ✅ Scale
-        df_merged["finalscore_scaled"] = minmax_scaling(df_merged["finalscore"])
-
-        # ✅ Final unique ranking — just like merged_results
-        df_ranked_full = (
-            df_merged
-            .sort_values("finalscore_scaled", ascending=False)
-            .drop_duplicates(subset=["UNIQUE ID"], keep="first")
-        )
-
-        # This is your full ranked list
-        results = json.loads(df_ranked_full.to_json(orient="records"))
-
-        
-        # --- CLEAN COLUMN NAME COLLISIONS ---
-        for col in ["Role Person", "Role", "Responsibilities"]:
-            if f"{col}_x" in df_merged.columns:
-                df_merged[col] = df_merged[f"{col}_x"]
-            elif f"{col}_y" in df_merged.columns:
-                df_merged[col] = df_merged[f"{col}_y"]
-
-        df_merged = df_merged.loc[:, ~df_merged.columns.str.endswith(("_x", "_y"))]
-
-        # --- DROP DUPLICATE UNIQUE IDs (keep strongest match) ---
-        df_merged = df_merged.sort_values("finalscore_scaled", ascending=False)
-        df_merged = df_merged.drop_duplicates(subset=["UNIQUE ID"], keep="first")
-
-        # ✅ Final response
-        return func.HttpResponse(
-            json.dumps({
-                "status": "success",
+            return {
                 "metadata": {
                     "query": user_input,
-                    "source_blob": blob_url,
-                    "total_candidates": len(df_ranked_full),
-                    "returned_candidates": len(df_ranked_full),
+                    "total_candidates": len(df_ranked),
+                    "returned_candidates": len(results)
                 },
-                "results": results  # FULL ranked list
-            }, indent=2),
+                "results": results
+            }
+
+        # -------------------------------------------------------
+        # 5️⃣ Process each input
+        # -------------------------------------------------------
+        output_list = [process_one_input(u) for u in user_inputs]
+
+        # Return single or list depending on input type
+        final_output = output_list[0] if single_mode else output_list
+
+        return func.HttpResponse(
+            json.dumps(final_output, indent=2),
             mimetype="application/json",
             status_code=200
         )
+
     except Exception as e:
-        logging.error(f"Error in hybrid_custom_talent_search: {e}", exc_info=True)
+        logging.error(f"Error in unified talent search: {e}", exc_info=True)
         return func.HttpResponse(
             json.dumps({"error": str(e)}), status_code=500
         )
