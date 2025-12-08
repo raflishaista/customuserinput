@@ -284,6 +284,21 @@ def blob_custom_talent_search_unified(req: func.HttpRequest) -> func.HttpRespons
                     df_merged[col] = df_merged[f"{col}_final"]
 
             df_merged = df_merged.loc[:, ~df_merged.columns.str.endswith("_final")]
+            
+            if "Job_Level" in df_merged.columns:
+                df_merged["Job_Level"] = pd.to_numeric(
+                    df_merged["Job_Level"], errors="coerce"
+                ).fillna(0)
+            else:
+                df_merged["Job_Level"] = 0
+
+            # Get requested job_level from user input
+            requested_job_level = int(job_level) if job_level is not None else 0
+
+            # Filter talents: only allow equal or higher level
+            df_merged = df_merged[
+                df_merged["Job_Level"] >= requested_job_level
+            ]
 
             # job_count from history
             if df_hist is not None and "UNIQUE ID" in df_hist.columns:
